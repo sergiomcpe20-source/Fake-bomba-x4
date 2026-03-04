@@ -1,0 +1,279 @@
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+local Stats = game:GetService("Stats")
+
+local shared = odh_shared_plugins
+if not shared then
+    shared.Notify("odh_shared_plugins not found. This plugin expects the shared UI API present.", 3)
+    return
+end
+
+local notify = shared.Notify
+local hook = hookfunction or hookfunc
+if not hook then
+    shared.Notify("No hookfunction/hookfunc available in this environment.", 3)
+    return
+end
+
+local silentAimEnabled = false
+local hitbox = "HumanoidRootPart"
+local verticalPrediction = 1.0
+local horizontalPrediction = 1.0
+local simulationDivider = 1.0
+local predictionInterval = 50
+local prioritizePing = true
+local jumpPrediction = true
+local exposeTargeting = false
+local lastPredictionUpdate = 0
+local cachedPrediction = 0.1
+
+local section = shared.AddSection("Revert Silent Aim (Fake)")
+
+section:AddToggle("Enable Silent Aim <font color=\"rgb(0, 0, 255)\">(Premium)</font>", function(state)
+    silentAimEnabled = state
+end)
+
+section:AddSlider("Vertical Prediction", 0, 1000, 100, function(val)
+    verticalPrediction = val / 100
+end)
+
+section:AddSlider("Horizontal Prediction", 0, 1000, 100, function(val)
+    horizontalPrediction = val / 100
+end)
+
+section:AddSlider("Simulation Divider", 1, 100, 1, function(val)
+    simulationDivider = val
+end)
+
+section:AddSlider("Prediction Interval (ms)", 10, 500, predictionInterval, function(val)
+    predictionInterval = val
+end)
+
+section:AddToggle("Prioritize Your Ping", function(state)
+    prioritizePing = state
+end)
+
+section:AddToggle("Jump Prediction", function(state)
+    jumpPrediction = state
+end)
+
+section:AddToggle("Expose Targeting", function(state)
+    exposeTargeting = state
+end)
+
+local function getCurrentPing()
+    local ok, pingItem = pcall(function()
+        return Stats.Network and Stats.Network.ServerStatsItem and Stats.Network.ServerStatsItem["Data Ping"]
+    end)
+    if ok and pingItem then
+        local pingMs = 0
+        pcall(function() pingMs = pingItem:GetValue() end)
+        return pingMs / 1000
+    end
+    return 0.1
+end
+
+local function getPredictionTime()
+    local now = tick() * 1000
+    if now - lastPredictionUpdate >= predictionInterval then
+        lastPredictionUpdate = now
+        if prioritizePing then
+            cachedPrediction = getCurrentPing()
+        end
+    end
+    return cachedPrediction
+end
+
+local function getHitboxPart(character)
+    if not character then return nil end
+    if exposeTargeting then
+        local mouse = LocalPlayer:GetMouse()
+        local closest, closestDist = nil, math.huge
+        local cameraPos = Camera.CFrame.Position
+        local parts = {"Head", "HumanoidRootPart", "LeftUpperArm", "RightUpperArm", "LeftUpperLeg", "RightUpperLeg", "UpperTorso"}
+        
+        for _, partName in ipairs(parts) do
+            local part = character:FindFirstChild(partName)
+            if part and part:IsA("BasePart") then
+                local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+                if onScreen then
+                    local ray = Ray.new(cameraPos, (part.Position - cameraPos).Unit * 1000)
+                    local ignoreList = {LocalPlayer.Character, Camera}
+                    local hit, hitPos = workspace:FindPartOnRayWithIgnoreList(ray, ignoreList)
+                    if hit and hit:IsDescendantOf(character) then
+                        local dist = (Vector2.new(screenPos.X, screenPos.Y) - Vector2.new(mouse.X, mouse.Y)).Magnitude
+                        if dist < closestDist then
+                            closest, closestDist = part, dist
+                        end
+                    end
+                end
+            end
+        end
+        return closest or character:FindFirstChild("HumanoidRootPart")
+    end
+    return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getMurderer()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local backpack = plr:FindFirstChild("Backpack")
+            if (backpack and backpack:FindFirstChild("Knife")) or plr.Character:FindFirstChild("Knife") then
+                return plr
+            end
+        end
+    end
+    return nil
+end
+
+local old
+local function hookFunc(self, ...)
+    if not silentAimEnabled then
+        return old(self, ...)
+    end
+
+    if not self or not self.Name or not self.Parent or self.Name ~= "RemoteFunction" or tostring(self.Parent.Name) ~= "CreateBeam" then
+        return old(self, ...)
+    end
+
+    local args = { ... }
+    if not tonumber(args[1]) or args[3] ~= "AH2" then
+        return old(self, ...)
+    end
+
+    local targetPlayer = getMurderer()
+    if not targetPlayer then
+        return old(self, ...)
+    end
+
+    local part = getHitboxPart(targetPlayer.Character)
+    if not part then
+        return old(self, ...)
+    end
+
+    local t = getPredictionTime()
+    local velocity = Vector3.new(0,0,0)
+    pcall(function() velocity = part.AssemblyLinearVelocity end)
+
+    local hPred = horizontalPrediction
+    local simDiv = simulationDivider
+    local velX = (velocity.X / simDiv) * hPred
+    local velY = (velocity.Y / simDiv) * (jumpPrediction and verticalPrediction or 0)
+    local velZ = (velocity.Z / simDiv) * hPred
+
+    local predicted = part.Position + Vector3.new(velX, velY, velZ) * t
+
+    return old(self, args[1], predicted, args[3])
+end
+
+local fakeRemote = Instance.new("RemoteFunction")
+local invokeServer = fakeRemote.InvokeServer
+fakeRemote:Destroy()
+old = hook(invokeServer, hookFunc)
+
+local buttonSize = 100
+local mobileButton = nil
+
+section:AddSlider("Mobile Button Size", 40, 200, 100, function(val)
+    buttonSize = val
+    if mobileButton and mobileButton:FindFirstChild("ShootButton") then
+        local btn = mobileButton.ShootButton
+        btn.Size = UDim2.new(0, buttonSize, 0, buttonSize)
+    end
+end)
+
+section:AddToggle("Shoot Button <font color=\"rgb(0, 0, 255)\">(Premium)</font>", function(state)
+    if state then
+        if mobileButton then mobileButton:Destroy() end
+
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "SilentAimMobileGUI"
+        gui.ResetOnSpawn = false
+        gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+        local button = Instance.new("TextButton")
+        button.Name = "ShootButton"
+        button.Text = "Shoot"
+        button.Font = Enum.Font.SourceSansBold
+        button.TextScaled = true
+        button.TextColor3 = Color3.fromRGB(0, 85, 255)
+        button.BackgroundColor3 = Color3.fromRGB(173, 216, 255)
+        button.BackgroundTransparency = 0.4
+        button.BorderSizePixel = 3
+        button.BorderColor3 = Color3.fromRGB(0, 85, 255)
+        button.Size = UDim2.new(0, buttonSize, 0, buttonSize)
+        button.Position = UDim2.new(0.85, 0, 0.6, 0)
+        button.Active = true
+        button.Draggable = true
+        button.Parent = gui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0.3, 0)
+        corner.Parent = button
+
+        local function equipAndShoot()
+            local char = LocalPlayer.Character
+            if not char then return end
+            local humanoid = char:FindFirstChild("Humanoid")
+            if not humanoid then return end
+
+            local equipped = false
+            for _, tool in ipairs(char:GetChildren()) do
+                if tool:IsA("Tool") and tool.Name:lower():find("gun") then
+                    equipped = true
+                    break
+                end
+            end
+
+            if not equipped then
+                local backpack = LocalPlayer:FindFirstChild("Backpack")
+                if backpack then
+                    for _, tool in ipairs(backpack:GetChildren()) do
+                        if tool:IsA("Tool") and tool.Name:lower():find("gun") then
+                            humanoid:EquipTool(tool)
+                            equipped = true
+                            break
+                        end
+                    end
+                end
+            end
+
+            if not equipped then
+                return
+            end
+
+            task.wait(0.05)
+            pcall(function()
+                for _, tool in pairs(char:GetChildren()) do
+                    if tool:IsA("Tool") then
+                        tool:Activate()
+                    end
+                end
+            end)
+
+            task.wait(0.1)
+            humanoid:UnequipTools()
+        end
+
+        button.MouseButton1Down:Connect(function()
+            button.BackgroundColor3 = Color3.fromRGB(140, 190, 255)
+            button.Size = UDim2.new(0, buttonSize - 5, 0, buttonSize - 5)
+        end)
+
+        button.MouseButton1Up:Connect(function()
+            button.BackgroundColor3 = Color3.fromRGB(173, 216, 255)
+            button.Size = UDim2.new(0, buttonSize, 0, buttonSize)
+            equipAndShoot()
+        end)
+
+        mobileButton = gui
+        shared.Notify("✅ Mobile Shoot Button Enabled", 1)
+    else
+        if mobileButton then
+            mobileButton:Destroy()
+            mobileButton = nil
+        end
+        shared.Notify("❌ Mobile Shoot Button Disabled", 2)
+    end
+end)
